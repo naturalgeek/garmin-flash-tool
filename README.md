@@ -134,8 +134,10 @@ the same manual restart.
 ## Preparing the MAIN image (you supply it)
 
 **No firmware ships with this tool** — Garmin firmware is copyrighted. Supply the MAIN
-region extracted from **your own stock firmware `.gcd`** for **your** device. Default
-image path is `main_0x02BD.bin` (override with `--image`).
+region extracted from **your own stock firmware `.gcd`** for **your** device. `--flash-main`
+has **no default source**: you must pass either `--gcd FILE.gcd` (the MAIN region is
+extracted for you) or `--image main.bin` (a raw MAIN-region image). The two are mutually
+exclusive.
 
 A `.gcd` is a flat record stream from offset 8: `[u16 type][u16 length][body]` … until
 `type == 0xFFFF`. Concatenate the bodies of every **`0x02BD`** record. Helper:
