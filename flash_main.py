@@ -357,7 +357,20 @@ def main():
     ap.add_argument("--ERASE-ONLY", dest="erase_only", action="store_true",
                     help="DESTRUCTIVE TEST: erase the MAIN region and stop (no write). The device "
                          "will NOT boot until re-flashed. Requires --CONFIRM-FLASH too.")
+    ap.add_argument("--no-sudo", action="store_true",
+                    help="do NOT auto-elevate via sudo (use if you installed the udev rule or run as root)")
     args = ap.parse_args()
+
+    # Raw USB access needs root OR a udev rule. To work WITHOUT a udev rule, auto-elevate via
+    # sudo when not root (re-exec the same venv python + args as root). --no-sudo opts out.
+    if os.geteuid() != 0 and not args.no_sudo:
+        print("[perm] not root — re-executing via sudo so no udev rule is needed "
+              "(pass --no-sudo to skip).")
+        try:
+            os.execvp("sudo", ["sudo", sys.executable] + sys.argv)
+        except Exception as e:
+            print("[perm] sudo re-exec failed (%s); continuing as current user "
+                  "(will need a udev rule or it'll fail to open the device)." % e)
 
     print("=== Garmin MAIN recovery flasher ===")
     print("mode: %s" % ("LIVE FLASH (--CONFIRM-FLASH)" if args.confirm else "READ-ONLY / DRY-RUN"))

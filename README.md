@@ -127,10 +127,12 @@ the same manual restart.
 
 - **Linux**, **Python 3**, **`pyusb`** (`pip install -r requirements.txt`) + **libusb-1.0**
   (`sudo apt install libusb-1.0-0`).
-- A **udev rule** so a non-root user can open the device (install once):
+- **Root access** (raw USB requires it). **No udev rule needed** — by default the tool
+  **auto-elevates via `sudo`** when not run as root (just run it and enter your password). Prefer
+  rootless? Install the optional udev rule once and pass `--no-sudo`:
 
   ```bash
-  sudo ./install_udev.sh      # writes /etc/udev/rules.d/99-garmin.rules for VID 091e, reloads udev
+  sudo ./install_udev.sh      # OPTIONAL: /etc/udev/rules.d/99-garmin.rules for VID 091e; then use --no-sudo
   ```
 
 ## Preparing the MAIN image (you supply it)
@@ -221,8 +223,8 @@ is required (see "Rebooting").
   Re-enter preboot (hold `Up` while connecting USB) and run immediately.
 - **`ABORTING before stream: erase-ready status=11`.** Loader rejected the region. Re-enter
   preboot and retry; the tool aborts here instead of hanging the device.
-- **`Access denied` / permission errors.** udev rule missing — `sudo ./install_udev.sh`,
-  replug (or run once with `sudo`).
+- **`Access denied` / permission errors.** You ran with `--no-sudo` but no udev rule — either drop
+  `--no-sudo` (it auto-elevates via sudo) or install the udev rule (`sudo ./install_udev.sh`, replug).
 - **`pyusb unavailable` / no backend.** Install libusb-1.0 and `pip install -r requirements.txt`.
 - **`Start Session` gets no reply.** Not in preboot / window expired. Re-enter and retry.
 - **Flashed but it won't boot on its own.** Expected — **power-cycle** it (battery pull).
