@@ -20,7 +20,8 @@ Actions (choose one; default --info):
 
 Flash source (for --flash-main / --info dry-run) -- give EITHER:
   --image main.bin      a raw MAIN-region image, OR
-  --gcd firmware.gcd    a full .gcd (the MAIN region 0x02BD is extracted from it)
+  --gcd firmware.gcd    a full .gcd (the MAIN region is auto-detected + extracted; the tool
+                        refuses if that region is encrypted, as on newer Garmin devices)
 
 Examples:
   sudo python garmin_flash_tool.py --info
@@ -97,23 +98,63 @@ def assert_main_only(region_id):
         sys.exit("REFUSING: region id 0x%04x is not MAIN (0x%04x)." % (region_id, MAIN_REGION_DEFAULT))
 
 # ------------------------------------------------------------------ image source (bin or gcd) + checks
+def _shannon_entropy(blob, sample=1 << 20):
+    """Bits/byte over a sample. Plaintext ARM+strings ~6-6.5; encrypted/compressed ~7.9-8.0."""
+    b = blob[:sample] if len(blob) > sample else blob
+    if not b:
+        return 0.0
+    n = len(b)
+    ent = 0.0
+    for c in (b.count(i) for i in range(256)):
+        if c:
+            p = c / n
+            ent -= p * math.log2(p)
+    return ent
+
 def extract_main_from_gcd(path):
-    """Concatenate all 0x02BD (MAIN) record bodies from a .gcd -> raw MAIN region bytes."""
+    """Extract the MAIN firmware region from ANY Garmin .gcd -- the MAIN record type is NOT
+    hardcoded. Pick the record type with the largest total body size (that's the app region),
+    then PROVE it's plaintext firmware via the UTF-16LE 'Software Version' marker. If the
+    region is encrypted/compressed (newer devices), exit with an informative error rather than
+    returning unusable ciphertext."""
     d = open(path, "rb").read()
     if d[:8] != b"GARMINd\x00":
         sys.exit("[gcd] not a GARMINd GCD file: %s" % path)
-    off, n, out = 8, len(d), bytearray()
+    off, n, groups = 8, len(d), {}   # type -> [count, size, bytearray(bodies)]
     while off + 4 <= n:
         typ, ln = struct.unpack_from("<HH", d, off)
-        body = off + 4
+        off += 4
         if typ == 0xFFFF:
             break
-        if typ == GCD_MAIN_RECORD:
-            out += d[body:body + ln]
-        off = body + ln
-    if not out:
-        sys.exit("[gcd] no MAIN (0x%04x) region found in %s" % (GCD_MAIN_RECORD, path))
-    return bytes(out)
+        g = groups.setdefault(typ, [0, 0, bytearray()])
+        g[0] += 1; g[1] += ln; g[2] += d[off:off + ln]
+        off += ln
+    if not groups:
+        sys.exit("[gcd] no records found in %s" % path)
+    ranked = sorted(groups.items(), key=lambda kv: kv[1][1], reverse=True)
+    print("[gcd] region types: " + "  ".join("0x%04X(x%d,%dB)" % (t, g[0], g[1]) for t, g in ranked))
+    rtype, g = ranked[0]
+    blob = bytes(g[2])
+    print("[gcd] MAIN candidate: type 0x%04X  x%d records = %d bytes" % (rtype, g[0], len(blob)))
+    # proof: plaintext firmware carries a UTF-16LE "Software Version" marker, preceded by {hwid,ver}
+    i = blob.find("Software Version".encode("utf-16-le"))
+    if i >= 4:
+        hwid, ver = struct.unpack_from("<HH", blob, i - 4)
+        print("[gcd] verified plaintext firmware: HWID %d (0x%04x) version %d (%.2f), sum%%256=%d"
+              % (hwid, hwid, ver, ver / 100.0, sum(blob) % 256))
+        return blob
+    # no plaintext marker -> not usable. Encrypted/compressed vs unknown-format, told apart by entropy.
+    ent = _shannon_entropy(blob)
+    if ent >= 7.5:
+        sys.exit("[gcd] REFUSING: the MAIN region in this .gcd is NOT plaintext firmware -- it looks\n"
+                 "  ENCRYPTED or COMPRESSED (entropy %.2f bits/byte, no 'Software Version' marker,\n"
+                 "  sum%%256=%d). Newer Garmin devices (e.g. Montana 7x0) encrypt firmware regions;\n"
+                 "  extraction would yield ciphertext you cannot flash or patch without the decryption\n"
+                 "  key. This tool supports plaintext-firmware devices only (e.g. GPSMAP 276Cx)."
+                 % (ent, sum(blob) % 256))
+    sys.exit("[gcd] REFUSING: could not verify a MAIN firmware region (no 'Software Version' marker in\n"
+             "  the largest region 0x%04X; entropy %.2f bits/byte). Unrecognized firmware format --\n"
+             "  this tool targets plaintext-firmware Garmin devices." % (rtype, ent))
 
 def check_image(data, profile, skip_hash):
     problems = []
@@ -145,7 +186,7 @@ def load_flash_source(args, profile):
     if args.gcd:
         if not os.path.exists(args.gcd):
             return None, ["gcd file not found: %r" % args.gcd]
-        print("[src] extracting MAIN (0x%04x) from GCD: %s" % (GCD_MAIN_RECORD, args.gcd))
+        print("[src] extracting MAIN region from GCD (auto-detected): %s" % args.gcd)
         data = extract_main_from_gcd(args.gcd)
     else:
         if not args.image or not os.path.exists(args.image):
@@ -531,7 +572,8 @@ def main():
                         help="open the RAW bootloader console (DANGEROUS; requires --i-accept-the-risk)")
     # flash source (exactly one required for --flash-main; no default)
     ap.add_argument("--image", help="raw MAIN-region image for --flash-main (mutually exclusive with --gcd)")
-    ap.add_argument("--gcd", help="a full .gcd for --flash-main; the MAIN region (0x02BD) is extracted from it")
+    ap.add_argument("--gcd", help="a full .gcd for --flash-main; the MAIN region is auto-detected and "
+                                  "extracted (refuses if that region is encrypted)")
     # modifiers
     ap.add_argument("--allow-unknown-device", action="store_true",
                     help="permit flashing a HWID with no built-in profile (region 14, generic checks only)")
