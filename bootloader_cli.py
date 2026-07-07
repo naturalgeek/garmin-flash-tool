@@ -19,7 +19,7 @@ Reuses the protocol layer from flash_main.py (must sit alongside it).
 """
 import argparse, os, sys, struct, shlex, time
 
-import flash_main as fm   # reuse the proven Link + GUSB protocol constants/helpers
+import garmin_flash_tool as fm   # reuse the proven Link + GUSB protocol constants/helpers
 
 REGION_NAMES = {
     5:  "u-boot bootloader",
@@ -186,7 +186,6 @@ def main():
     ap = argparse.ArgumentParser(description="Interactive Garmin preboot bootloader console (DANGEROUS)")
     ap.add_argument("--i-accept-the-risk", dest="accept", action="store_true",
                     help="REQUIRED to start; you acknowledge this can permanently brick the device")
-    ap.add_argument("--no-sudo", action="store_true", help="do not auto-elevate via sudo")
     ap.add_argument("--wait-timeout", type=int, default=0, metavar="SEC",
                     help="seconds to wait for the device in preboot (0 = wait forever, default)")
     args = ap.parse_args()
@@ -197,13 +196,9 @@ def main():
                  "(erasing region 5/43 is unrecoverable). Re-run with --i-accept-the-risk if you\n"
                  "understand and accept the risk.")
 
-    if os.geteuid() != 0 and not args.no_sudo:
-        print("[perm] re-executing via sudo (no udev rule needed; --no-sudo to skip)...")
-        try:
-            os.execvp("sudo", ["sudo", sys.executable] + sys.argv)
-        except Exception as e:
-            sys.exit("[perm] FATAL: could not elevate via sudo (%s). Run as root, or install the "
-                     "udev rule and pass --no-sudo. Exiting." % e)
+    if os.geteuid() != 0:
+        sys.exit("[perm] this must be run as root. Re-run with sudo, e.g.:\n"
+                 "    sudo %s %s" % (sys.executable, " ".join(sys.argv)))
 
     print("=== Garmin preboot bootloader console ===")
     print("!!! DANGER: raw loader access. Erasing region 5/43 = PERMANENT brick; never flash 12=BOOT.")

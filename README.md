@@ -53,7 +53,7 @@ as an invalid region (status `11`). The tool uses region **14**.
 
 ### Safety design
 
-- **Read-only by default.** With no arguments, `flash_main.py` opens the device, runs a
+- **Read-only by default.** With no arguments, `garmin_flash_tool.py` opens the device, runs a
   read-only self-test (Start Session + product query), prints the detected model and a
   dry-run plan, and **sends no write or erase frames.** Only `--CONFIRM-FLASH` writes.
 - **MAIN only.** The write path aborts unless the region id is exactly `14`, and rejects
@@ -127,13 +127,9 @@ the same manual restart.
 
 - **Linux**, **Python 3**, **`pyusb`** (`pip install -r requirements.txt`) + **libusb-1.0**
   (`sudo apt install libusb-1.0-0`).
-- **Root access** (raw USB requires it). **No udev rule needed** — by default the tool
-  **auto-elevates via `sudo`** when not run as root (just run it and enter your password). Prefer
-  rootless? Install the optional udev rule once and pass `--no-sudo`:
-
-  ```bash
-  sudo ./install_udev.sh      # OPTIONAL: /etc/udev/rules.d/99-garmin.rules for VID 091e; then use --no-sudo
-  ```
+- **Run as root** — raw USB access requires it, so start the flasher with **`sudo`** (or as
+  root). It refuses to touch the device otherwise. (`--backup-userdata` is the exception: it
+  only reads the mounted mass-storage volume, so it needs no root.)
 
 ## Preparing the MAIN image (you supply it)
 
@@ -160,7 +156,7 @@ For the 276Cx the result must be **18322432 bytes** with `sum(bytes) % 256 == 0`
 2. **Read-only self-test** (safe):
 
    ```bash
-   python flash_main.py
+   sudo python garmin_flash_tool.py
    ```
 
    Opens `091e:0003`, prints endpoints, `Start Session` → `Session Started` (unit id),
@@ -170,8 +166,8 @@ For the 276Cx the result must be **18322432 bytes** with `sum(bytes) % 256 == 0`
 3. **Flash** (writes MAIN — only after the self-test looks right):
 
    ```bash
-   python flash_main.py --CONFIRM-FLASH                        # known device (e.g. 276Cx)
-   python flash_main.py --CONFIRM-FLASH --allow-unknown-device # untested model (at your risk)
+   sudo python garmin_flash_tool.py --CONFIRM-FLASH                        # known device (e.g. 276Cx)
+   sudo python garmin_flash_tool.py --CONFIRM-FLASH --allow-unknown-device # untested model (at your risk)
    ```
 
    Announce region 14 → wait for erase-ready `0` → stream `0x24` data (with offset
@@ -187,7 +183,7 @@ The USB protocol and `MAIN = region 14` are believed common across proprietary-O
 unencrypted Garmin handhelds — but **only the 276Cx is verified.** To try another model:
 
 1. Get that device's **stock `.gcd`** and extract its MAIN with `extract_main_region.py`.
-2. Add a profile in `flash_main.py` → `DEVICE_PROFILES`:
+2. Add a profile in `garmin_flash_tool.py` → `DEVICE_PROFILES`:
 
    ```python
    <HWID>: {"name": "<model>", "main_region": 0x000E, "main_size": <bytes>,
@@ -202,14 +198,29 @@ unencrypted Garmin handhelds — but **only the 276Cx is verified.** To try anot
 Out of scope: encrypted firmware (Fenix 5+/MARQ) and Android/Linux-based Garmin devices —
 this approach does not apply.
 
+## Backing up user data (waypoints / routes / tracks)
+
+Your waypoints, routes and tracks are GPX files in `/Garmin/GPX/` on the device's
+mass-storage volume. (Settings/calibration live in NFM flash, **not** on this volume, so they
+are not part of this backup.) To copy them off — **no root, no preboot**; just boot the device
+normally so it mounts as USB mass storage:
+
+```bash
+python garmin_flash_tool.py --backup-userdata ./mybackup
+# or point it at the volume explicitly:
+python garmin_flash_tool.py --backup-userdata ./mybackup --volume /media/you/GARMIN
+```
+
+It auto-detects the mounted GARMIN volume, copies `/Garmin/GPX/**` (plus `GarminDevice.xml`)
+into the destination, and prints a summary.
+
 ## bootloader-cli — advanced raw console (DANGEROUS)
 
 `bootloader_cli.py` is an interactive console over the same GUSB primitives, for manual
-low-level work. It **requires `--i-accept-the-risk` to start** and auto-elevates via sudo like
-the flasher:
+low-level work. It **requires `--i-accept-the-risk` to start** and **must be run as root**:
 
 ```bash
-python bootloader_cli.py --i-accept-the-risk
+sudo python bootloader_cli.py --i-accept-the-risk
 ```
 
 Commands (in the `gbl>` prompt): `session`, `product`, `regions`, `status <region>`,
@@ -225,11 +236,10 @@ Commands (in the `gbl>` prompt): `session`, `product`, `regions`, `status <regio
 ## Field notes (the sequence that recovered a 276Cx)
 
 1. Device bricked → only enters preboot (`091e:0003`), stable.
-2. `sudo ./install_udev.sh` once.
-3. Enter preboot; `python flash_main.py` → `Session Started` + HWID 2479 / 5.80.
-4. `python flash_main.py --CONFIRM-FLASH` → announce region 14 → erase-ready `0` →
+2. Enter preboot; `sudo python garmin_flash_tool.py` → `Session Started` + HWID 2479 / 5.80.
+3. `sudo python garmin_flash_tool.py --CONFIRM-FLASH` → announce region 14 → erase-ready `0` →
    stream 18 MB (~73k `0x24` packets, each `[u32 offset][250 data]`) → commit.
-5. **Battery-pull power-cycle** → boots the new firmware.
+4. **Battery-pull power-cycle** → boots the new firmware.
 
 Bugs fixed while developing this (each cost a flash attempt): announcing GCD type
 `0x02BD` instead of loader region `14`; reading replies from bulk IN instead of interrupt
@@ -244,8 +254,8 @@ is required (see "Rebooting").
   Re-enter preboot (hold `Up` while connecting USB) and run immediately.
 - **`ABORTING before stream: erase-ready status=11`.** Loader rejected the region. Re-enter
   preboot and retry; the tool aborts here instead of hanging the device.
-- **`Access denied` / permission errors.** You ran with `--no-sudo` but no udev rule — either drop
-  `--no-sudo` (it auto-elevates via sudo) or install the udev rule (`sudo ./install_udev.sh`, replug).
+- **`Access denied` / permission errors, or `[perm] this must be run as root`.** Start the tool
+  with **`sudo`** (raw USB needs root).
 - **`pyusb unavailable` / no backend.** Install libusb-1.0 and `pip install -r requirements.txt`.
 - **`Start Session` gets no reply.** Not in preboot / window expired. Re-enter and retry.
 - **Flashed but it won't boot on its own.** Expected — **power-cycle** it (battery pull).

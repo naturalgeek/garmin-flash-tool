@@ -1,28 +1,25 @@
 #!/usr/bin/env python3
 """
-flash_main.py -- Native Linux recovery flasher for soft-bricked Garmin handhelds.
+garmin-flash-tool -- native Linux recovery flasher for soft-bricked Garmin handhelds.
 
 Reflashes the MAIN firmware region over Garmin's USB protocol (GUSB) via the device's
-PREBOOT programming interface (VID 0x091E, PID 0x0003 -- the loader that comes up when
-you power on holding D-pad Up with USB connected). No Windows / no Updater.exe needed.
+PREBOOT programming interface (VID 0x091E, PID 0x0003 -- the loader that comes up when you
+power on holding D-pad Up with USB connected). Also backs up on-device user data (GPX) from
+the normal mass-storage volume. No Windows / no Updater.exe needed.
 
   ####################################################################################
-  #  SAFETY: READ-ONLY / DRY-RUN by default.  Sends NO write or erase frames unless   #
-  #  you pass --CONFIRM-FLASH.  Only ever writes the MAIN region; BOOT/ramloader/      #
-  #  u-boot/x-loader region ids are hard-refused. BOOT is the recovery escape hatch.   #
+  #  MUST BE RUN AS ROOT (sudo) for the USB/flash operations -- raw USB needs it.     #
+  #  READ-ONLY / DRY-RUN by default; sends NO write/erase unless --CONFIRM-FLASH.     #
+  #  Only ever writes the MAIN region; BOOT/ramloader/u-boot/x-loader are refused.    #
   ####################################################################################
 
-Tested ONLY on the GPSMAP 276Cx (HWID 2479). The GUSB protocol and the MAIN=region-14
-convention are expected to be common across proprietary-OS Garmin handhelds, but any
-other model is UNTESTED -- see DEVICE_PROFILES and --allow-unknown-device.
+Tested ONLY on the GPSMAP 276Cx (HWID 2479). Other models are untested (see DEVICE_PROFILES
+and --allow-unknown-device). No USB reboot exists on these loaders -- after a flash you must
+power-cycle the unit manually (battery pull).
 
-Reboot: there is NO USB reboot command on these loaders (confirmed by decompiling
-Updater.exe -- it just CloseHandle()s and relies on the device auto-rebooting). The
-276Cx preboot loader does NOT auto-reboot, so after a flash you MUST power-cycle the
-unit manually (battery pull -- the power button is dead while in the loader).
-
-  python flash_main.py                 # read-only self-test + dry-run (default)
-  python flash_main.py --CONFIRM-FLASH # actually write MAIN (human-gated)
+  sudo python garmin_flash_tool.py                      # read-only self-test + dry-run
+  sudo python garmin_flash_tool.py --CONFIRM-FLASH      # write MAIN (human-gated)
+  python garmin_flash_tool.py --backup-userdata ./bak   # copy /Garmin/GPX from mass storage (no root/preboot)
 """
 import argparse, struct, sys, time, hashlib, os, math
 
@@ -30,42 +27,35 @@ import argparse, struct, sys, time, hashlib, os, math
 VID          = 0x091E
 PID_PREBOOT  = 0x0003
 
-LAYER_APP        = 20          # 0x14 application layer
-LAYER_TRANSPORT  = 0           # transport / USB-protocol layer
+LAYER_APP        = 20
+LAYER_TRANSPORT  = 0
 
-PID_DATA_AVAIL      = 0x02     # (L0) device has data -> read bulk IN
-PID_START_SESSION   = 0x05     # (L0) host -> dev
-PID_SESSION_STARTED = 0x06     # (L0) dev -> host, payload = u32 unit id
-PID_PRODUCT_RQST    = 0xfe     # (L20) 254 host -> dev
-PID_PRODUCT_DATA    = 0xff     # (L20) 255 dev -> host {u16 product}{u16 ver}{ascii name}
+PID_DATA_AVAIL      = 0x02
+PID_START_SESSION   = 0x05
+PID_SESSION_STARTED = 0x06
+PID_PRODUCT_RQST    = 0xfe
+PID_PRODUCT_DATA    = 0xff
 
-PID_ANNOUNCE = 0x4b            # RgnStart  {u16 region, u32 size}
-PID_STATUS   = 0x4a            # RgnStatus {u16 region} -> {u16 status} (0 = ready/ok)
-PID_DATA     = 0x24            # RgnData   {u32 offset}{<=250 data}
-PID_COMMIT   = 0x2d            # RgnCmplt  {u16 region}
-PID_CRC_RQST = 0x3a4           # GetRgnChecksum (optional; not implemented by preboot loader)
+PID_ANNOUNCE = 0x4b
+PID_STATUS   = 0x4a
+PID_DATA     = 0x24
+PID_COMMIT   = 0x2d
+PID_CRC_RQST = 0x3a4
 PID_CRC_REPL = 0x3a9
 
-CHUNK = 250                    # file bytes per 0x24 packet (offset prefix is separate)
+CHUNK = 250
 
 MAIN_REGION_DEFAULT = 0x000E   # 14 = fw_all.bin (MAIN). The ONLY region kind this tool writes.
-# BOOT/ramloader (12), GCD-BOOT record type (8/0x0008), u-boot (5), x-loader (43): NEVER touch.
-FORBIDDEN_REGIONS = {0x0008, 8, 12, 5, 43}
+FORBIDDEN_REGIONS = {0x0008, 8, 12, 5, 43}   # BOOT/ramloader/u-boot/x-loader: NEVER touch.
 
-# ------------------------------------------------------------------ device profiles
-# HWID (product id from the product-request reply) -> flashing parameters.
-# Only entries with "tested": True have been verified on real hardware.
 DEVICE_PROFILES = {
-    2479: {                       # 0x09AF
+    2479: {   # 0x09AF
         "name": "GPSMAP 276Cx",
-        "main_region": 0x000E,    # 14
+        "main_region": 0x000E,   # 14
         "main_size": 18322432,
-        "sha1_prefix": "d2d0f35f75d3",   # stock 5.90 MAIN (region 0x02BD payload)
+        "sha1_prefix": "d2d0f35f75d3",   # stock 5.90 MAIN
         "tested": True,
     },
-    # To support another model, add: HWID: {"name":..., "main_region":14,
-    #   "main_size":<bytes>, "sha1_prefix":<optional>, "tested":False}. Region 14 = MAIN
-    #   is expected to hold across proprietary-OS Garmin units but is UNCONFIRMED elsewhere.
 }
 
 # ------------------------------------------------------------------ framing helpers
@@ -87,7 +77,6 @@ def assert_main_only(region_id):
     if region_id in FORBIDDEN_REGIONS:
         sys.exit("REFUSING: region id %r is BOOT/ramloader/u-boot/x-loader class. HARD RULE: MAIN only." % (region_id,))
     if region_id != MAIN_REGION_DEFAULT:
-        # All known profiles use 14; anything else is almost certainly a mistake.
         sys.exit("REFUSING: region id 0x%04x is not MAIN (0x%04x)." % (region_id, MAIN_REGION_DEFAULT))
 
 # ------------------------------------------------------------------ image
@@ -116,10 +105,10 @@ class Link:
         self.usb = usb.core
         self.util = usb.util
         self.dev = None
-        self.ep_in = None          # primary read pipe = interrupt IN
-        self.ep_int_in = None      # interrupt IN (0x82) -- protocol replies
-        self.ep_bulk_in = None     # bulk IN (0x83) -- bulk data
-        self.ep_out = None         # bulk OUT (0x01)
+        self.ep_in = None
+        self.ep_int_in = None
+        self.ep_bulk_in = None
+        self.ep_out = None
         self.intf = None
         self._detached = False
 
@@ -181,8 +170,6 @@ class Link:
             time.sleep(0.5)
 
     def _read_frame_ep(self, ep, timeout_ms):
-        """Read one GUSB frame, skipping zero-length keep-alives / NAK timeouts until a
-        real (>=12 byte) frame arrives or the deadline passes."""
         deadline = time.time() + (timeout_ms / 1000.0)
         raw = b""
         while time.time() < deadline:
@@ -238,16 +225,13 @@ class Link:
         return None
 
     def product_request(self):
-        """Return (product_id, sw_version, name) or (None, None, None)."""
         print("[product] TX Product_Rqst")
         try:
             self.ep_out.write(build_frame(PID_PRODUCT_RQST, b"", layer=LAYER_APP), timeout=3000)
             layer, pid, payload = self.read_reply(4000)
             if pid is not None and len(payload) >= 4:
                 prod, ver = struct.unpack_from("<HH", payload, 0)
-                name = ""
-                if len(payload) > 4:
-                    name = payload[4:].split(b"\x00")[0].decode("latin-1", "replace")
+                name = payload[4:].split(b"\x00")[0].decode("latin-1", "replace") if len(payload) > 4 else ""
                 print("[product] HWID=%d (0x%04x)  sw_version=%d (%.2f)  %s" % (prod, prod, ver, ver / 100.0, name))
                 return prod, ver, name
         except Exception as e:
@@ -287,23 +271,20 @@ def dry_run_plan(region, size):
     nchunks = math.ceil(size / CHUNK)
     last = size - (nchunks - 1) * CHUNK
     ann = struct.pack("<HI", region, size)
-    print("")
-    print("===== DRY-RUN PLAN =====")
+    print("\n===== DRY-RUN PLAN =====")
     print("region id (MAIN)  : 0x%04x (%d)" % (region, region))
     print("image size        : %d bytes" % size)
     print("0x24 data chunks  : %d  (last %d B, each body = [u32 offset][<=250 data])" % (nchunks, last))
     print("0x4b announce      : header %s  payload %s" % (hexs(build_header(PID_ANNOUNCE, len(ann))), hexs(ann)))
-    print("========================")
-    print("")
+    print("========================\n")
     return nchunks
 
-# ------------------------------------------------------------------ flash
+# ------------------------------------------------------------------ flash / erase
 def do_flash(link, region, data):
     assert_main_only(region)
     size = len(data)
     if not link.start_session():
         sys.exit("REFUSING: could not Start Session before flash.")
-
     link.send(PID_ANNOUNCE, struct.pack("<HI", region, size))
     print("[flash] announced region 0x%04x; waiting for erase-ready status (10-90s)..." % region)
     link.send(PID_STATUS, struct.pack("<H", region))
@@ -314,9 +295,8 @@ def do_flash(link, region, data):
         sys.exit("REFUSING to stream: no erase-ready reply. Re-run to retry.")
     if rstat != 0:
         sys.exit("ABORTING before stream: erase-ready status=%r (nonzero = loader rejected region "
-                 "0x%04x). Nothing streamed. (status 11 = invalid region or bad request.)" % (rstat, region))
+                 "0x%04x). Nothing streamed." % (rstat, region))
     print("[flash] erase-ready OK. streaming...")
-
     off = 0
     idx = 0
     t0 = time.time()
@@ -327,21 +307,14 @@ def do_flash(link, region, data):
         idx += 1
         if idx % 5000 == 0 or off >= size:
             print("[flash] %d bytes / %d" % (off, size))
-
-    link.send(PID_COMMIT, struct.pack("<H", region))    # fire-and-forget; no success status is returned
+    link.send(PID_COMMIT, struct.pack("<H", region))
     print("[flash] commit sent. streamed+committed in %.1fs" % (time.time() - t0))
-    print("")
-    print("===== FLASH COMPLETE — MAIN region 0x%04x written =====" % region)
-    print("  Gate met: erase-ready status 0 + full %d-byte stream + commit." % size)
-    print("")
+    print("\n===== FLASH COMPLETE — MAIN region 0x%04x written =====" % region)
     print("  >>> NOW POWER-CYCLE THE DEVICE to boot the new firmware. <<<")
-    print("  There is NO USB reboot on this loader (confirmed by decompiling Garmin's own")
-    print("  Updater.exe -- it also just closes the handle and relies on a restart). If the")
-    print("  power button is unresponsive in the loader, briefly remove the battery, then")
-    print("  power on normally (no keys). It should boot straight into the new firmware.")
+    print("  There is NO USB reboot on this loader. If the power button is unresponsive in the")
+    print("  loader, briefly remove the battery, then power on normally (no keys).")
     return True
 
-# ------------------------------------------------------------------ erase-only (destructive test)
 def do_erase(link, region, size):
     assert_main_only(region)
     if not link.start_session():
@@ -354,16 +327,59 @@ def do_erase(link, region, size):
     print("[erase] erase-ready status: id=%r status=%r" % (pid, rstat))
     if pid is None or rstat != 0:
         sys.exit("erase NOT confirmed (status=%r). Region may be unchanged." % rstat)
-    print("")
-    print("===== MAIN REGION 0x%04x ERASED (no data written) =====" % region)
-    print("  The device will NOT boot now -- expect 'Missing System Software' / no boot.")
-    print("  This is the intended test state. RECOVER by re-entering preboot and running:")
-    print("      python flash_main.py --CONFIRM-FLASH")
+    print("\n===== MAIN REGION 0x%04x ERASED (no data written) =====" % region)
+    print("  The device will NOT boot now -- expect 'System Software Missing'. RECOVER with:")
+    print("      sudo python garmin_flash_tool.py --CONFIRM-FLASH")
     return True
+
+# ------------------------------------------------------------------ user-data backup (mass storage; no root/preboot)
+def find_garmin_volume(explicit):
+    import glob
+    if explicit:
+        return explicit if os.path.isdir(os.path.join(explicit, "Garmin")) else None
+    user = os.environ.get("SUDO_USER") or os.environ.get("USER") or "*"
+    pats = ["/media/%s/*" % user, "/media/*/*", "/run/media/%s/*" % user, "/run/media/*/*",
+            "/mnt/*", "/Volumes/*"]
+    seen = []
+    for p in pats:
+        for c in glob.glob(p):
+            if c not in seen:
+                seen.append(c)
+    for c in seen:
+        if os.path.isdir(os.path.join(c, "Garmin", "GPX")) or os.path.isdir(os.path.join(c, "Garmin")):
+            return c
+    return None
+
+def do_backup_userdata(dest, volume):
+    import shutil
+    vol = find_garmin_volume(volume)
+    if not vol:
+        sys.exit("Could not find a mounted Garmin volume with a /Garmin folder.\n"
+                 "Boot the device normally, connect USB so it mounts as mass storage, then re-run\n"
+                 "(or pass --volume /path/to/GARMIN).")
+    src = os.path.join(vol, "Garmin")
+    print("[backup] Garmin volume: %s" % vol)
+    os.makedirs(dest, exist_ok=True)
+    copied = []
+    gpx = os.path.join(src, "GPX")
+    if os.path.isdir(gpx):
+        shutil.copytree(gpx, os.path.join(dest, "GPX"), dirs_exist_ok=True)
+        copied.append("GPX (waypoints/routes/tracks/contacts)")
+    for f in ("GarminDevice.xml", "Device.fit"):
+        p = os.path.join(src, f)
+        if os.path.isfile(p):
+            shutil.copy2(p, dest)
+            copied.append(f)
+    if not copied:
+        sys.exit("[backup] nothing to copy -- no /Garmin/GPX found under %s" % src)
+    print("[backup] copied to %s:" % dest)
+    for c in copied:
+        print("   - %s" % c)
+    print("[backup] done. (Settings/calibration live in NFM flash, not on this volume -- not backed up.)")
 
 # ------------------------------------------------------------------ main
 def main():
-    ap = argparse.ArgumentParser(description="Garmin MAIN-region USB recovery flasher (read-only by default)")
+    ap = argparse.ArgumentParser(description="garmin-flash-tool: MAIN-region USB recovery flasher (read-only by default)")
     ap.add_argument("--image", default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "main_0x02BD.bin"),
                     help="MAIN region image to flash (extract from YOUR device's stock .gcd/.rgn)")
     ap.add_argument("--CONFIRM-FLASH", dest="confirm", action="store_true",
@@ -373,30 +389,28 @@ def main():
     ap.add_argument("--skip-image-hash", action="store_true",
                     help="skip the known-image SHA-1 match (still enforces size + checksum)")
     ap.add_argument("--ERASE-ONLY", dest="erase_only", action="store_true",
-                    help="DESTRUCTIVE TEST: erase the MAIN region and stop (no write). The device "
-                         "will NOT boot until re-flashed. Requires --CONFIRM-FLASH too.")
-    ap.add_argument("--no-sudo", action="store_true",
-                    help="do NOT auto-elevate via sudo (use if you installed the udev rule or run as root)")
+                    help="DESTRUCTIVE TEST: erase MAIN and stop (no write). Requires --CONFIRM-FLASH.")
     ap.add_argument("--wait-timeout", type=int, default=0, metavar="SEC",
                     help="seconds to wait for the device in preboot (0 = wait forever, default)")
+    ap.add_argument("--backup-userdata", metavar="DIR",
+                    help="copy /Garmin/GPX (waypoints/routes/tracks) from the mounted mass-storage "
+                         "volume to DIR. Does NOT need root or preboot; device booted normally.")
+    ap.add_argument("--volume", metavar="PATH", help="explicit path to the mounted GARMIN volume (for --backup-userdata)")
     args = ap.parse_args()
 
-    # Raw USB access needs root OR a udev rule. To work WITHOUT a udev rule, auto-elevate via
-    # sudo when not root (re-exec the same venv python + args as root). --no-sudo opts out.
-    if os.geteuid() != 0 and not args.no_sudo:
-        print("[perm] not root — re-executing via sudo so no udev rule is needed "
-              "(pass --no-sudo to skip).")
-        try:
-            os.execvp("sudo", ["sudo", sys.executable] + sys.argv)
-        except Exception as e:
-            # sudo binary not found / could not exec -> abort, do NOT limp on as non-root.
-            sys.exit("[perm] FATAL: could not elevate via sudo (%s). Run as root, or install the "
-                     "udev rule and pass --no-sudo. Exiting." % e)
+    # user-data backup is a plain filesystem copy from the mass-storage volume -> no root/preboot.
+    if args.backup_userdata is not None:
+        do_backup_userdata(args.backup_userdata, args.volume)
+        return
 
-    print("=== Garmin MAIN recovery flasher ===")
+    # everything below talks raw USB to the preboot loader -> must be root.
+    if os.geteuid() != 0:
+        sys.exit("[perm] this must be run as root. Re-run with sudo, e.g.:\n"
+                 "    sudo %s %s" % (sys.executable, " ".join(sys.argv)))
+
+    print("=== garmin-flash-tool ===")
     print("mode: %s" % ("LIVE FLASH (--CONFIRM-FLASH)" if args.confirm else "READ-ONLY / DRY-RUN"))
 
-    # wait for the device to appear in preboot (091e:0003), then open it
     try:
         link = Link()
     except Exception as e:
@@ -412,7 +426,6 @@ def main():
         sys.exit("[device] not found at 091e:0003 within %ds." % args.wait_timeout)
 
     try:
-        # comms + identify
         if not link.start_session():
             sys.exit("Start Session failed -> comms not established (are you in preboot?).")
         hwid, ver, name = link.product_request()
@@ -420,13 +433,11 @@ def main():
         profile = DEVICE_PROFILES.get(hwid)
         if profile:
             region = profile["main_region"]
-            tag = "TESTED" if profile.get("tested") else "profile present, UNTESTED"
-            print("[device] recognized HWID %d = %s (%s)" % (hwid, profile["name"], tag))
+            print("[device] recognized HWID %d = %s (%s)" % (hwid, profile["name"], "TESTED" if profile.get("tested") else "UNTESTED"))
         else:
             region = MAIN_REGION_DEFAULT
             print("[device] HWID %r has NO built-in profile. MAIN=region 14 assumed (UNCONFIRMED for this model)." % hwid)
 
-        # erase-only destructive test (no image needed)
         if args.erase_only:
             if not args.confirm:
                 sys.exit("REFUSING: --ERASE-ONLY is destructive; also pass --CONFIRM-FLASH.")
@@ -436,7 +447,6 @@ def main():
             do_erase(link, region, size)
             return
 
-        # verify image
         data, problems = load_and_check_image(args.image, profile, args.skip_image_hash)
         for p in problems:
             print("[image] PROBLEM: %s" % p)
@@ -445,19 +455,17 @@ def main():
             if data is not None:
                 dry_run_plan(region, len(data))
             print("[selftest] comms OK. Read-only complete — no data written.")
-            print("[selftest] to flash: python flash_main.py --CONFIRM-FLASH"
+            print("[selftest] to flash: sudo python garmin_flash_tool.py --CONFIRM-FLASH"
                   + ("" if profile else " --allow-unknown-device"))
             return
 
-        # ---- flash gating ----
         if data is None:
             sys.exit("REFUSING: image could not be loaded/verified.")
         if problems:
-            sys.exit("REFUSING to flash: image checks failed (see above). Fix the image or use "
-                     "--skip-image-hash only if you are certain.")
+            sys.exit("REFUSING to flash: image checks failed (see above).")
         if not profile and not args.allow_unknown_device:
             sys.exit("REFUSING: HWID %r has no tested profile. Re-run with --allow-unknown-device "
-                     "ONLY if you are sure region 14 = MAIN for your model and the image is correct." % hwid)
+                     "ONLY if you are sure region 14 = MAIN for your model." % hwid)
         assert_main_only(region)
         do_flash(link, region, data)
     finally:
