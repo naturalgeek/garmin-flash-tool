@@ -1,4 +1,4 @@
-# garmin-flasher
+# garmin-flash-tool
 
 A native **Linux** tool to reflash the **MAIN firmware region** of a soft-bricked
 Garmin handheld over Garmin's USB protocol (GUSB), using the device's **preboot
@@ -166,12 +166,16 @@ For the 276Cx the result must be **18322432 bytes** with `sum(bytes) % 256 == 0`
 3. **Flash** (writes MAIN — only after the self-test looks right):
 
    ```bash
-   sudo python garmin_flash_tool.py --CONFIRM-FLASH                        # known device (e.g. 276Cx)
-   sudo python garmin_flash_tool.py --CONFIRM-FLASH --allow-unknown-device # untested model (at your risk)
+   sudo python garmin_flash_tool.py --flash-main --gcd GPSMAP276Cx_590.gcd   # source: a full .gcd
+   sudo python garmin_flash_tool.py --flash-main --image main_0x02BD.bin     # source: raw MAIN .bin
    ```
 
-   Announce region 14 → wait for erase-ready `0` → stream `0x24` data (with offset
-   prefix) → `0x2d` commit. Then **power-cycle the device** (see "Rebooting").
+   Either source works — with `--gcd` the MAIN region (`0x02BD`) is extracted for you. The tool
+   verifies the image (size + checksum + known SHA-1) **and** that its baked version matches the
+   device's **bootloader** version — a MAIN-only flash of a *different* version is refused unless
+   you pass `--force-version` (a mismatch can cause issues; Garmin flashes BOOT+MAIN together).
+   Announce region 14 → wait erase-ready `0` → stream `0x24` (offset-prefixed) → `0x2d` commit,
+   then **power-cycle the device** (see "Rebooting").
 
    > A commit that returns **status 11** means the staged image was rejected (bad `0x24`
    > framing or wrong region). The `GetRgnChecksum` (`0x3a4`) verify command is **not
@@ -198,29 +202,13 @@ unencrypted Garmin handhelds — but **only the 276Cx is verified.** To try anot
 Out of scope: encrypted firmware (Fenix 5+/MARQ) and Android/Linux-based Garmin devices —
 this approach does not apply.
 
-## Backing up user data (waypoints / routes / tracks)
+## `--cli` — raw bootloader console (DANGEROUS)
 
-Your waypoints, routes and tracks are GPX files in `/Garmin/GPX/` on the device's
-mass-storage volume. (Settings/calibration live in NFM flash, **not** on this volume, so they
-are not part of this backup.) To copy them off — **no root, no preboot**; just boot the device
-normally so it mounts as USB mass storage:
+`--cli` opens an interactive console over the raw GUSB primitives, for manual low-level work.
+It **requires `--i-accept-the-risk`** and **must be run as root**:
 
 ```bash
-python garmin_flash_tool.py --backup-userdata ./mybackup
-# or point it at the volume explicitly:
-python garmin_flash_tool.py --backup-userdata ./mybackup --volume /media/you/GARMIN
-```
-
-It auto-detects the mounted GARMIN volume, copies `/Garmin/GPX/**` (plus `GarminDevice.xml`)
-into the destination, and prints a summary.
-
-## bootloader-cli — advanced raw console (DANGEROUS)
-
-`bootloader_cli.py` is an interactive console over the same GUSB primitives, for manual
-low-level work. It **requires `--i-accept-the-risk` to start** and **must be run as root**:
-
-```bash
-sudo python bootloader_cli.py --i-accept-the-risk
+sudo python garmin_flash_tool.py --cli --i-accept-the-risk
 ```
 
 Commands (in the `gbl>` prompt): `session`, `product`, `regions`, `status <region>`,
@@ -264,7 +252,7 @@ is required (see "Rebooting").
 
 ## License
 
-Copyright (C) 2026 the garmin-flasher contributors.
+Copyright (C) 2026 the garmin-flash-tool contributors.
 
 Free software under the **GNU General Public License version 3 (GPLv3)** — see
 [LICENSE](LICENSE). Distributed **WITHOUT ANY WARRANTY**.
