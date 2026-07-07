@@ -225,7 +225,7 @@ Commands (in the `gbl>` prompt): `session`, `product`, `regions`, `status <regio
 
 1. Device bricked → only enters preboot (`091e:0003`), stable.
 2. Enter preboot; `sudo python garmin_flash_tool.py` → `Session Started` + HWID 2479 / 5.80.
-3. `sudo python garmin_flash_tool.py --CONFIRM-FLASH` → announce region 14 → erase-ready `0` →
+3. `sudo python garmin_flash_tool.py --flash-main` → announce region 14 → erase-ready `0` →
    stream 18 MB (~73k `0x24` packets, each `[u32 offset][250 data]`) → commit.
 4. **Battery-pull power-cycle** → boots the new firmware.
 
