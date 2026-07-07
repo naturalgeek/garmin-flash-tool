@@ -111,12 +111,13 @@ def _shannon_entropy(blob, sample=1 << 20):
             ent -= p * math.log2(p)
     return ent
 
-def extract_main_from_gcd(path):
+def extract_main_from_gcd(path, allow_unverified=False):
     """Extract the MAIN firmware region from ANY Garmin .gcd -- the MAIN record type is NOT
     hardcoded. Pick the record type with the largest total body size (that's the app region),
-    then PROVE it's plaintext firmware via the UTF-16LE 'Software Version' marker. If the
-    region is encrypted/compressed (newer devices), exit with an informative error rather than
-    returning unusable ciphertext."""
+    then PROVE it's plaintext firmware via the UTF-16LE 'Software Version' marker. If the region
+    is encrypted/compressed (newer devices) the proof fails: exit with an informative error --
+    UNLESS allow_unverified (--force-gcd-region), in which case return the size-guessed largest
+    region anyway (it is still byte-for-byte flashable; the device decrypts at boot)."""
     d = open(path, "rb").read()
     if d[:8] != b"GARMINd\x00":
         sys.exit("[gcd] not a GARMINd GCD file: %s" % path)
@@ -143,24 +144,37 @@ def extract_main_from_gcd(path):
         print("[gcd] verified plaintext firmware: HWID %d (0x%04x) version %d (%.2f), sum%%256=%d"
               % (hwid, hwid, ver, ver / 100.0, sum(blob) % 256))
         return blob
-    # no plaintext marker -> not usable. Encrypted/compressed vs unknown-format, told apart by entropy.
+    # no plaintext marker -> can't verify. Encrypted/compressed vs unknown-format, told apart by entropy.
     ent = _shannon_entropy(blob)
-    if ent >= 7.5:
-        sys.exit("[gcd] REFUSING: the MAIN region in this .gcd is NOT plaintext firmware -- it looks\n"
-                 "  ENCRYPTED or COMPRESSED (entropy %.2f bits/byte, no 'Software Version' marker,\n"
-                 "  sum%%256=%d). Newer Garmin devices (e.g. Montana 7x0) encrypt firmware regions;\n"
-                 "  extraction would yield ciphertext you cannot flash or patch without the decryption\n"
-                 "  key. This tool supports plaintext-firmware devices only (e.g. GPSMAP 276Cx)."
-                 % (ent, sum(blob) % 256))
+    enc = ent >= 7.5
+    kind = "appears ENCRYPTED/COMPRESSED" if enc else "is an UNRECOGNIZED format"
+    if allow_unverified:
+        print("[gcd] WARNING: largest region 0x%04X %s (entropy %.2f, no 'Software Version' marker,\n"
+              "  sum%%256=%d) -- CANNOT verify it is MAIN. Using it anyway (--force-gcd-region):\n"
+              "  it is MAIN by SIZE ONLY. An encrypted region is still byte-for-byte flashable (the\n"
+              "  device decrypts at boot), BUT if this is not the 276Cx family the loader region index\n"
+              "  (%d) may be WRONG for your device -- verify it before flashing."
+              % (rtype, kind, ent, sum(blob) % 256, MAIN_REGION_DEFAULT))
+        return blob
+    if enc:
+        sys.exit("[gcd] REFUSING: the MAIN region in this .gcd is NOT plaintext firmware -- it %s\n"
+                 "  (entropy %.2f bits/byte, no 'Software Version' marker, sum%%256=%d). Newer Garmin\n"
+                 "  devices (e.g. Montana 7x0) encrypt firmware regions. It is still byte-for-byte\n"
+                 "  flashable to the correct device+region; if you know what you are doing, re-run with\n"
+                 "  --force-gcd-region to use the largest region by size. Otherwise aborting." % (kind, ent, sum(blob) % 256))
     sys.exit("[gcd] REFUSING: could not verify a MAIN firmware region (no 'Software Version' marker in\n"
-             "  the largest region 0x%04X; entropy %.2f bits/byte). Unrecognized firmware format --\n"
-             "  this tool targets plaintext-firmware Garmin devices." % (rtype, ent))
+             "  the largest region 0x%04X; entropy %.2f bits/byte). Re-run with --force-gcd-region to\n"
+             "  use the largest region by size regardless." % (rtype, ent))
 
-def check_image(data, profile, skip_hash):
+def check_image(data, profile, skip_hash, allow_unverified=False):
     problems = []
     if (sum(data) % 256) != 0:
-        problems.append("region checksum invalid: sum(bytes)%%256=%d (Garmin MAIN must be 0)" % (sum(data) % 256))
-    if profile:
+        msg = "region checksum invalid: sum(bytes)%%256=%d (plaintext Garmin MAIN must be 0)" % (sum(data) % 256)
+        if allow_unverified:
+            print("[image] NOTE: %s -- ignored (--force-gcd-region; expected for encrypted firmware)" % msg)
+        else:
+            problems.append(msg)
+    if profile and not allow_unverified:
         if len(data) != profile["main_size"]:
             problems.append("size %d != %s MAIN size %d" % (len(data), profile["name"], profile["main_size"]))
         sha1 = hashlib.sha1(data).hexdigest()
@@ -187,14 +201,14 @@ def load_flash_source(args, profile):
         if not os.path.exists(args.gcd):
             return None, ["gcd file not found: %r" % args.gcd]
         print("[src] extracting MAIN region from GCD (auto-detected): %s" % args.gcd)
-        data = extract_main_from_gcd(args.gcd)
+        data = extract_main_from_gcd(args.gcd, allow_unverified=args.force_gcd_region)
     else:
         if not args.image or not os.path.exists(args.image):
             return None, ["MAIN image not found: %r  (or pass --gcd FILE.gcd)" % args.image]
         print("[src] MAIN image: %s" % args.image)
         data = open(args.image, "rb").read()
     print("[src] length=%d  sum%%256=%d  sha1=%s" % (len(data), sum(data) % 256, hashlib.sha1(data).hexdigest()[:16]))
-    return data, check_image(data, profile, args.skip_image_hash)
+    return data, check_image(data, profile, args.skip_image_hash, allow_unverified=args.force_gcd_region)
 
 # ------------------------------------------------------------------ USB layer
 class Link:
@@ -582,6 +596,10 @@ def main():
     ap.add_argument("--force-version", action="store_true",
                     help="allow --flash-main even if the MAIN image version differs from the device's "
                          "bootloader version (normally refused, since a mismatch can cause issues)")
+    ap.add_argument("--force-gcd-region", action="store_true",
+                    help="with --gcd: flash the LARGEST region even if it can't be verified as plaintext "
+                         "MAIN (e.g. encrypted firmware). DANGEROUS: identified by SIZE only, and the "
+                         "loader region index may be wrong on non-276Cx devices. Relaxes checksum/hash checks.")
     ap.add_argument("--wait-timeout", type=int, default=0, metavar="SEC",
                     help="seconds to wait for the device in preboot (0 = wait forever, default)")
     ap.add_argument("--i-accept-the-risk", dest="accept_risk", action="store_true",
